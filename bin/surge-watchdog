@@ -1,0 +1,659 @@
+#!/bin/sh
+
+# Surge Watchdog: health-check and recover Surge Gateway Mode on macOS.
+
+set -u
+
+PROGRAM_NAME="surge-watchdog"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DEFAULT_CONFIG_FILE="${SCRIPT_DIR%/bin}/config"
+CONFIG_FILE="${SURGE_WATCHDOG_CONFIG:-$DEFAULT_CONFIG_FILE}"
+STATE_DIR="${SURGE_WATCHDOG_STATE_DIR:-$HOME/Library/Application Support/surge-watchdog/state}"
+
+# Defaults match the current home-network topology.
+SURGE_APP_PATH="/Applications/Surge.app"
+SURGE_PROCESS_NAME="Surge"
+SURGE_CLI_PATH="/Applications/Surge.app/Contents/Applications/surge-cli"
+SURGE_UI_HELPER_APP="$HOME/Applications/Surge Watchdog.app"
+UI_IPC_DIR="$HOME/Library/Application Support/surge-watchdog/state"
+SURGE_GATEWAY_STATE_FILE="$HOME/Library/Application Support/com.nssurge.surge-mac/dhcpd/server.json"
+SURGE_DHCP_PID_FILE="$HOME/Library/Application Support/com.nssurge.surge-mac/dhcpd/pid"
+SURGE_DNS_IP="198.18.0.2"
+DNS_TEST_NAME="surge-watchdog.invalid"
+CHECK_PROCESS="1"
+CHECK_GATEWAY_MODE="1"
+CHECK_DNS="1"
+FAILURE_THRESHOLD="3"
+RESTART_COOLDOWN_SECONDS="120"
+MAX_RESTARTS_PER_HOUR="3"
+CLI_STOP_TIMEOUT_SECONDS="8"
+PROCESS_STOP_TIMEOUT_SECONDS="10"
+RECOVERY_VERIFY_SECONDS="60"
+RECOVERY_VERIFY_INTERVAL_SECONDS="5"
+UI_HELPER_TIMEOUT_SECONDS="45"
+ENABLE_UI_FALLBACK="0"
+MONITORING_ENABLED="1"
+LOG_RETENTION_DAYS="7"
+LOG_DIRECTORY="${SURGE_WATCHDOG_LOG_DIR:-$HOME/Library/Logs/Surge Watchdog}"
+
+MODE="run"
+HEALTH_REASONS=""
+HEALTH_DETAILS=""
+GATEWAY_REASON=""
+DHCP_PROCESS_REASON=""
+DISCOVERED_GATEWAY_IP=""
+DISCOVERED_GATEWAY_INTERFACE=""
+
+usage() {
+    printf '%s\n' "Usage: $PROGRAM_NAME [--run|--status|--ui-probe|--help]"
+    printf '%s\n' "  --run     Check once, update failure state, and recover Surge when needed."
+    printf '%s\n' "  --status  Check once without changing state or restarting Surge."
+    printf '%s\n' "  --ui-probe Inspect the Surge Gateway Mode controls without restarting services."
+    printf '%s\n' "  --help    Show this help."
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --run) MODE="run" ;;
+        --status) MODE="status" ;;
+        --ui-probe) MODE="ui-probe" ;;
+        --help|-h) usage; exit 0 ;;
+        *) printf '%s\n' "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+load_config() {
+    [ -r "$CONFIG_FILE" ] || return 0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+
+        key=${line%%=*}
+        value=${line#*=}
+
+        case "$key" in
+            SURGE_APP_PATH) SURGE_APP_PATH=$value ;;
+            SURGE_PROCESS_NAME) SURGE_PROCESS_NAME=$value ;;
+            SURGE_CLI_PATH) SURGE_CLI_PATH=$value ;;
+            SURGE_UI_HELPER_APP) SURGE_UI_HELPER_APP=$value ;;
+            SURGE_GATEWAY_STATE_FILE) SURGE_GATEWAY_STATE_FILE=$value ;;
+            SURGE_DHCP_PID_FILE) SURGE_DHCP_PID_FILE=$value ;;
+            SURGE_DNS_IP) SURGE_DNS_IP=$value ;;
+            DNS_TEST_NAME) DNS_TEST_NAME=$value ;;
+            CHECK_PROCESS) CHECK_PROCESS=$value ;;
+            CHECK_GATEWAY_MODE) CHECK_GATEWAY_MODE=$value ;;
+            CHECK_DNS) CHECK_DNS=$value ;;
+            FAILURE_THRESHOLD) FAILURE_THRESHOLD=$value ;;
+            RESTART_COOLDOWN_SECONDS) RESTART_COOLDOWN_SECONDS=$value ;;
+            MAX_RESTARTS_PER_HOUR) MAX_RESTARTS_PER_HOUR=$value ;;
+            CLI_STOP_TIMEOUT_SECONDS) CLI_STOP_TIMEOUT_SECONDS=$value ;;
+            PROCESS_STOP_TIMEOUT_SECONDS) PROCESS_STOP_TIMEOUT_SECONDS=$value ;;
+            RECOVERY_VERIFY_SECONDS) RECOVERY_VERIFY_SECONDS=$value ;;
+            RECOVERY_VERIFY_INTERVAL_SECONDS) RECOVERY_VERIFY_INTERVAL_SECONDS=$value ;;
+            UI_HELPER_TIMEOUT_SECONDS) UI_HELPER_TIMEOUT_SECONDS=$value ;;
+            ENABLE_UI_FALLBACK) ENABLE_UI_FALLBACK=$value ;;
+            MONITORING_ENABLED) MONITORING_ENABLED=$value ;;
+            LOG_RETENTION_DAYS) LOG_RETENTION_DAYS=$value ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_config() {
+    for value in "$CHECK_PROCESS" "$CHECK_GATEWAY_MODE" "$CHECK_DNS" "$ENABLE_UI_FALLBACK" "$MONITORING_ENABLED"; do
+        case "$value" in 0|1) ;; *) return 1 ;; esac
+    done
+    [ "$CHECK_PROCESS$CHECK_GATEWAY_MODE$CHECK_DNS" != "000" ] || return 1
+
+    is_uint "$FAILURE_THRESHOLD" || return 1
+    is_uint "$RESTART_COOLDOWN_SECONDS" || return 1
+    is_uint "$MAX_RESTARTS_PER_HOUR" || return 1
+    is_uint "$CLI_STOP_TIMEOUT_SECONDS" || return 1
+    is_uint "$PROCESS_STOP_TIMEOUT_SECONDS" || return 1
+    is_uint "$RECOVERY_VERIFY_SECONDS" || return 1
+    is_uint "$RECOVERY_VERIFY_INTERVAL_SECONDS" || return 1
+    is_uint "$UI_HELPER_TIMEOUT_SECONDS" || return 1
+    is_uint "$LOG_RETENTION_DAYS" || return 1
+    [ "$FAILURE_THRESHOLD" -gt 0 ] || return 1
+    [ "$MAX_RESTARTS_PER_HOUR" -gt 0 ] || return 1
+    [ "$CLI_STOP_TIMEOUT_SECONDS" -gt 0 ] || return 1
+    [ "$PROCESS_STOP_TIMEOUT_SECONDS" -gt 0 ] || return 1
+    [ "$RECOVERY_VERIFY_SECONDS" -gt 0 ] || return 1
+    [ "$RECOVERY_VERIFY_INTERVAL_SECONDS" -gt 0 ] || return 1
+    [ "$UI_HELPER_TIMEOUT_SECONDS" -gt 0 ] || return 1
+    [ "$LOG_RETENTION_DAYS" -gt 0 ] || return 1
+    [ "$LOG_RETENTION_DAYS" -le 90 ] || return 1
+}
+
+log() {
+    log_line="$(/bin/date '+%Y-%m-%d %H:%M:%S') [$PROGRAM_NAME] $*"
+    printf '%s\n' "$log_line"
+    if [ "$MODE" = "run" ] && [ -n "$LOG_DIRECTORY" ]; then
+        /bin/mkdir -p "$LOG_DIRECTORY"
+        printf '%s\n' "$log_line" >> "$LOG_DIRECTORY/watchdog-$(/bin/date '+%Y-%m-%d').log"
+    fi
+}
+
+prune_logs_if_due() {
+    [ -n "$LOG_DIRECTORY" ] || return 0
+    /bin/mkdir -p "$LOG_DIRECTORY"
+    prune_file="$STATE_DIR/last_log_prune_epoch"
+    prune_now=$(/bin/date +%s)
+    last_prune=$(read_uint_file "$prune_file")
+    [ $((prune_now - last_prune)) -ge 3600 ] || return 0
+    /usr/bin/find "$LOG_DIRECTORY" -type f -name 'watchdog-*.log' \
+        -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    write_uint_file "$prune_file" "$prune_now"
+}
+
+append_reason() {
+    if [ -z "$HEALTH_REASONS" ]; then
+        HEALTH_REASONS=$1
+    else
+        HEALTH_REASONS="$HEALTH_REASONS, $1"
+    fi
+}
+
+app_running() {
+    /usr/bin/pgrep -x "$SURGE_PROCESS_NAME" >/dev/null 2>&1 && return 0
+    /usr/bin/pgrep -f "$SURGE_APP_PATH/Contents/MacOS/Surge" >/dev/null 2>&1
+}
+
+is_ipv4() {
+    printf '%s\n' "$1" | /usr/bin/awk -F. '
+        BEGIN { valid = 1 }
+        NF != 4 { valid = 0 }
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) valid = 0
+            }
+        }
+        END { exit valid ? 0 : 1 }
+    '
+}
+
+read_gateway_state() {
+    /usr/bin/plutil -extract "$1" raw -o - "$SURGE_GATEWAY_STATE_FILE" 2>/dev/null
+}
+
+dhcp_process_healthy() {
+    DHCP_PROCESS_REASON=""
+    case "${SURGE_WATCHDOG_FORCE_DHCP_PROCESS:-}" in
+        healthy) return 0 ;;
+        unhealthy) DHCP_PROCESS_REASON="forced unhealthy test state"; return 1 ;;
+    esac
+
+    if [ ! -r "$SURGE_DHCP_PID_FILE" ]; then
+        DHCP_PROCESS_REASON="PID file is missing or unreadable"
+        return 1
+    fi
+    dhcp_pid=$(/bin/cat "$SURGE_DHCP_PID_FILE" 2>/dev/null) || {
+        DHCP_PROCESS_REASON="cannot read PID file"
+        return 1
+    }
+    if ! is_uint "$dhcp_pid"; then
+        DHCP_PROCESS_REASON="PID file does not contain a valid process ID"
+        return 1
+    fi
+
+    dhcp_command=$(/bin/ps -p "$dhcp_pid" -o comm= 2>/dev/null) || {
+        DHCP_PROCESS_REASON="PID $dhcp_pid is not running or is not visible"
+        return 1
+    }
+    if ! printf '%s\n' "$dhcp_command" | /usr/bin/grep -Eiq 'dhcp'; then
+        DHCP_PROCESS_REASON="PID $dhcp_pid is $dhcp_command, not a DHCP process"
+        return 1
+    fi
+    return 0
+}
+
+arp_has_gateway() {
+    case "${SURGE_WATCHDOG_SKIP_ARP:-0}" in
+        1) return 0 ;;
+    esac
+
+    arp_output=$(/usr/sbin/arp -n "$DISCOVERED_GATEWAY_IP" 2>/dev/null || true)
+    if printf '%s\n' "$arp_output" | \
+        /usr/bin/grep -Eiq ' at ([0-9a-f]{1,2}:){5}[0-9a-f]{1,2}([[:space:]]|$)'; then
+        return 0
+    fi
+
+    # The VM may ignore ICMP, but this still triggers an ARP resolution.
+    /sbin/ping -n -q -c 1 -W 1000 "$DISCOVERED_GATEWAY_IP" >/dev/null 2>&1 || true
+    arp_output=$(/usr/sbin/arp -n "$DISCOVERED_GATEWAY_IP" 2>/dev/null || true)
+    printf '%s\n' "$arp_output" | \
+        /usr/bin/grep -Eiq ' at ([0-9a-f]{1,2}:){5}[0-9a-f]{1,2}([[:space:]]|$)'
+}
+
+gateway_mode_healthy() {
+    GATEWAY_REASON=""
+    DISCOVERED_GATEWAY_IP=""
+    DISCOVERED_GATEWAY_INTERFACE=""
+
+    if [ ! -r "$SURGE_GATEWAY_STATE_FILE" ]; then
+        GATEWAY_REASON="Gateway Mode state file is missing"
+        return 1
+    fi
+
+    use_vmnet=$(read_gateway_state useVMNET) || {
+        GATEWAY_REASON="cannot read useVMNET from Gateway Mode state"
+        return 1
+    }
+    if [ "$use_vmnet" != "true" ]; then
+        GATEWAY_REASON="Surge Gateway VM is disabled"
+        return 1
+    fi
+
+    use_dhcp=$(read_gateway_state useDHCP) || {
+        GATEWAY_REASON="cannot read useDHCP from Gateway Mode state"
+        return 1
+    }
+    if [ "$use_dhcp" != "true" ]; then
+        GATEWAY_REASON="Surge DHCP is disabled"
+        return 1
+    fi
+
+    DISCOVERED_GATEWAY_IP=$(read_gateway_state vmnetIP) || {
+        GATEWAY_REASON="cannot discover the Gateway VM IP"
+        return 1
+    }
+    if ! is_ipv4 "$DISCOVERED_GATEWAY_IP"; then
+        GATEWAY_REASON="Gateway VM IP is invalid: $DISCOVERED_GATEWAY_IP"
+        return 1
+    fi
+
+    DISCOVERED_GATEWAY_INTERFACE=$(read_gateway_state interface 2>/dev/null || true)
+
+    if ! dhcp_process_healthy; then
+        GATEWAY_REASON="Surge DHCP process check failed: $DHCP_PROCESS_REASON"
+        return 1
+    fi
+
+    if ! arp_has_gateway; then
+        GATEWAY_REASON="Gateway VM $DISCOVERED_GATEWAY_IP has no valid ARP neighbor"
+        return 1
+    fi
+
+    HEALTH_DETAILS="Gateway VM $DISCOVERED_GATEWAY_IP"
+    if [ -n "$DISCOVERED_GATEWAY_INTERFACE" ]; then
+        HEALTH_DETAILS="$HEALTH_DETAILS on $DISCOVERED_GATEWAY_INTERFACE"
+    fi
+    return 0
+}
+
+dns_healthy() {
+    dns_output=$(/usr/bin/dig "@$SURGE_DNS_IP" "$DNS_TEST_NAME" A \
+        +time=2 +tries=1 +noall +comments 2>/dev/null) || return 1
+    printf '%s\n' "$dns_output" | /usr/bin/grep -Eq 'status: (NOERROR|NXDOMAIN)'
+}
+
+check_health() {
+    HEALTH_REASONS=""
+    HEALTH_DETAILS=""
+
+    case "${SURGE_WATCHDOG_FORCE_HEALTH:-}" in
+        healthy) return 0 ;;
+        unhealthy) HEALTH_REASONS="forced unhealthy test state"; return 1 ;;
+    esac
+
+    if [ "$CHECK_PROCESS" = "1" ] && ! app_running; then
+        append_reason "Surge process is not running"
+    fi
+    if [ "$CHECK_GATEWAY_MODE" = "1" ] && ! gateway_mode_healthy; then
+        append_reason "$GATEWAY_REASON"
+    fi
+    if [ "$CHECK_DNS" = "1" ] && ! dns_healthy; then
+        append_reason "DNS $SURGE_DNS_IP is not responding"
+    fi
+
+    [ -z "$HEALTH_REASONS" ]
+}
+
+read_uint_file() {
+    file=$1
+    value=0
+    if [ -r "$file" ]; then
+        value=$(/bin/cat "$file" 2>/dev/null || printf '0')
+    fi
+    is_uint "$value" || value=0
+    printf '%s\n' "$value"
+}
+
+write_uint_file() {
+    printf '%s\n' "$2" > "$1"
+}
+
+prune_restart_history() {
+    now=$1
+    history_file=$2
+    cutoff=$((now - 3600))
+    temporary_file="$history_file.tmp.$$"
+
+    if [ -r "$history_file" ]; then
+        /usr/bin/awk -v cutoff="$cutoff" '$1 >= cutoff { print $1 }' \
+            "$history_file" > "$temporary_file"
+    else
+        : > "$temporary_file"
+    fi
+    /bin/mv "$temporary_file" "$history_file"
+}
+
+wait_for_app_exit() {
+    timeout_seconds=$1
+    waited=0
+    while app_running && [ "$waited" -lt "$timeout_seconds" ]; do
+        /bin/sleep 1
+        waited=$((waited + 1))
+    done
+    ! app_running
+}
+
+stop_with_surge_cli() {
+    [ -x "$SURGE_CLI_PATH" ] || return 1
+
+    log "Requesting a safe stop through the official Surge CLI"
+    "$SURGE_CLI_PATH" --raw stop >/dev/null 2>&1 &
+    cli_pid=$!
+    waited=0
+    while /bin/kill -0 "$cli_pid" >/dev/null 2>&1 && \
+        [ "$waited" -lt "$CLI_STOP_TIMEOUT_SECONDS" ]; do
+        /bin/sleep 1
+        waited=$((waited + 1))
+    done
+
+    if /bin/kill -0 "$cli_pid" >/dev/null 2>&1; then
+        /bin/kill -TERM "$cli_pid" >/dev/null 2>&1 || true
+        wait "$cli_pid" 2>/dev/null || true
+        log "The Surge CLI stop command timed out"
+        return 1
+    fi
+
+    if ! wait "$cli_pid" 2>/dev/null; then
+        log "The Surge CLI stop command failed"
+        return 1
+    fi
+
+    if wait_for_app_exit "$CLI_STOP_TIMEOUT_SECONDS"; then
+        return 0
+    fi
+    log "Surge is still running after the CLI stop request"
+    return 1
+}
+
+stop_surge_safely() {
+    app_running || return 0
+
+    if stop_with_surge_cli; then
+        return 0
+    fi
+
+    log "Falling back to a graceful SIGTERM for the Surge app"
+    /usr/bin/pkill -TERM -x "$SURGE_PROCESS_NAME" >/dev/null 2>&1 || \
+        /usr/bin/pkill -TERM -f "$SURGE_APP_PATH/Contents/MacOS/Surge" >/dev/null 2>&1 || true
+
+    if wait_for_app_exit "$PROCESS_STOP_TIMEOUT_SECONDS"; then
+        return 0
+    fi
+
+    log "Surge did not exit after SIGTERM; refusing to force-kill it"
+    return 1
+}
+
+wait_for_health() {
+    timeout_seconds=$1
+    waited=0
+    while [ "$waited" -lt "$timeout_seconds" ]; do
+        if check_health; then
+            return 0
+        fi
+        /bin/sleep "$RECOVERY_VERIFY_INTERVAL_SECONDS"
+        waited=$((waited + RECOVERY_VERIFY_INTERVAL_SECONDS))
+    done
+    check_health
+}
+
+invoke_ui_helper() (
+    requested_mode=$1
+    if [ ! -d "$SURGE_UI_HELPER_APP" ]; then
+        log "Surge Watchdog UI app is missing: $SURGE_UI_HELPER_APP"
+        return 1
+    fi
+
+    if ! /usr/bin/open -g "$SURGE_APP_PATH" >/dev/null 2>&1; then
+        log "Failed to open Surge for UI recovery"
+        return 1
+    fi
+    /bin/sleep 1
+
+    /bin/mkdir -p "$UI_IPC_DIR"
+    ui_lock_dir="$UI_IPC_DIR/ui-request.lock"
+    if ! /bin/mkdir "$ui_lock_dir" 2>/dev/null; then
+        lock_epoch=$(/usr/bin/stat -f %m "$ui_lock_dir" 2>/dev/null || printf '0')
+        now_epoch=$(/bin/date +%s)
+        stale_after=$((UI_HELPER_TIMEOUT_SECONDS + 15))
+        if is_uint "$lock_epoch" && [ $((now_epoch - lock_epoch)) -gt "$stale_after" ]; then
+            /bin/rmdir "$ui_lock_dir" 2>/dev/null || true
+        fi
+        if ! /bin/mkdir "$ui_lock_dir" 2>/dev/null; then
+            log "Another UI helper request is already running"
+            return 1
+        fi
+    fi
+
+    request_file="$UI_IPC_DIR/ui-request.json"
+    response_file="$UI_IPC_DIR/ui-response.json"
+    temporary_request="$request_file.tmp.$$"
+    trap '/bin/rm -f "$temporary_request" "$request_file" "$response_file"; /bin/rmdir "$ui_lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
+
+    request_id="$(/bin/date +%s).$$"
+    created_epoch=$(/bin/date +%s)
+    /bin/rm -f "$request_file" "$response_file"
+    (
+        umask 077
+        printf '%s\n' "{\"requestID\":\"$request_id\",\"mode\":\"$requested_mode\",\"createdEpoch\":$created_epoch}" > "$temporary_request"
+    )
+    /bin/mv "$temporary_request" "$request_file"
+
+    if ! /usr/bin/open -g "$SURGE_UI_HELPER_APP" >/dev/null 2>&1; then
+        log "Failed to open the Surge Watchdog app"
+        return 1
+    fi
+    waited=0
+    while [ ! -r "$response_file" ] && [ "$waited" -lt "$UI_HELPER_TIMEOUT_SECONDS" ]; do
+        /bin/sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ ! -r "$response_file" ]; then
+        log "Surge Watchdog UI timed out after ${UI_HELPER_TIMEOUT_SECONDS}s"
+        return 1
+    fi
+
+    response_id=$(/usr/bin/plutil -extract requestID raw -o - "$response_file" 2>/dev/null || true)
+    response_status=$(/usr/bin/plutil -extract status raw -o - "$response_file" 2>/dev/null || true)
+    response_message=$(/usr/bin/plutil -extract message raw -o - "$response_file" 2>/dev/null || true)
+    if [ "$response_id" != "$request_id" ]; then
+        log "Surge Watchdog UI returned a mismatched response"
+        return 1
+    fi
+    if [ "$response_status" != "ok" ]; then
+        log "Surge Watchdog UI failed: $response_message"
+        return 1
+    fi
+
+    printf '%s\n' "$response_message"
+)
+
+run_ui_fallback() {
+    log "Trying the optional native Surge Watchdog UI fallback"
+    if ! ui_output=$(invoke_ui_helper recover); then
+        [ -z "$ui_output" ] || printf '%s\n' "$ui_output"
+        return 1
+    fi
+    log "UI fallback requested: $ui_output"
+}
+
+probe_ui_fallback() {
+    if ! ui_output=$(invoke_ui_helper probe); then
+        [ -z "$ui_output" ] || printf '%s\n' "$ui_output"
+        return 1
+    fi
+    /bin/mkdir -p "$STATE_DIR"
+    /bin/date +%s > "$STATE_DIR/ui_probe_success_epoch"
+    log "UI probe succeeded: $ui_output"
+}
+
+recover_surge() {
+    if [ "$ENABLE_UI_FALLBACK" = "1" ] && app_running; then
+        log "Trying targeted Gateway Mode UI recovery before restarting the entire Surge app"
+        if run_ui_fallback; then
+            if wait_for_health "$RECOVERY_VERIFY_SECONDS"; then
+                log "Targeted Gateway Mode recovery completed and all enabled health checks passed"
+                return 0
+            fi
+            log "Surge is still unhealthy after targeted UI recovery: $HEALTH_REASONS"
+        else
+            log "Targeted UI recovery was unavailable; continuing with safe app recovery"
+        fi
+    fi
+
+    if ! stop_surge_safely; then
+        return 1
+    fi
+
+    log "Launching $SURGE_APP_PATH"
+    if ! /usr/bin/open -gj "$SURGE_APP_PATH"; then
+        log "Failed to launch Surge"
+        return 1
+    fi
+
+    if wait_for_health "$RECOVERY_VERIFY_SECONDS"; then
+        log "Recovery completed and all enabled health checks passed"
+        return 0
+    fi
+
+    log "Surge is still unhealthy after relaunch: $HEALTH_REASONS"
+    if [ "$ENABLE_UI_FALLBACK" != "1" ]; then
+        log "UI fallback is disabled"
+        return 1
+    fi
+
+    if ! run_ui_fallback; then
+        return 1
+    fi
+
+    if wait_for_health "$RECOVERY_VERIFY_SECONDS"; then
+        log "UI recovery completed and all enabled health checks passed"
+        return 0
+    fi
+
+    log "Surge is still unhealthy after UI recovery: $HEALTH_REASONS"
+    return 1
+}
+
+load_config
+if ! validate_config; then
+    log "Invalid configuration in $CONFIG_FILE"
+    exit 2
+fi
+
+if [ "$MODE" = "run" ] && [ "$MONITORING_ENABLED" != "1" ]; then
+    exit 0
+fi
+
+if [ "$MODE" = "ui-probe" ]; then
+    probe_ui_fallback
+    exit $?
+fi
+
+if [ "$MODE" = "status" ]; then
+    if check_health; then
+        if [ -n "$HEALTH_DETAILS" ]; then
+            log "Healthy: enabled checks passed ($HEALTH_DETAILS)"
+        else
+            log "Healthy: enabled checks passed"
+        fi
+        exit 0
+    fi
+    log "Unhealthy: $HEALTH_REASONS"
+    exit 1
+fi
+
+if [ "${SURGE_WATCHDOG_DRY_RUN:-0}" = "1" ]; then
+    if check_health; then
+        log "Dry run healthy"
+        exit 0
+    fi
+    log "Dry run unhealthy: $HEALTH_REASONS"
+    exit 1
+fi
+
+/bin/mkdir -p "$STATE_DIR"
+LOCK_DIR="$STATE_DIR/run.lock"
+if ! /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    log "Another watchdog check is already running"
+    exit 0
+fi
+trap '/bin/rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
+
+prune_logs_if_due
+
+FAILURE_FILE="$STATE_DIR/consecutive_failures"
+LAST_RESTART_FILE="$STATE_DIR/last_restart_epoch"
+RESTART_HISTORY_FILE="$STATE_DIR/restart_history"
+
+if check_health; then
+    write_uint_file "$FAILURE_FILE" 0
+    if [ -n "$HEALTH_DETAILS" ]; then
+        log "Healthy ($HEALTH_DETAILS)"
+    else
+        log "Healthy"
+    fi
+    exit 0
+fi
+
+failure_count=$(read_uint_file "$FAILURE_FILE")
+failure_count=$((failure_count + 1))
+write_uint_file "$FAILURE_FILE" "$failure_count"
+log "Unhealthy ($failure_count/$FAILURE_THRESHOLD): $HEALTH_REASONS"
+
+if [ "$failure_count" -lt "$FAILURE_THRESHOLD" ]; then
+    exit 1
+fi
+
+now=$(/bin/date +%s)
+last_restart=$(read_uint_file "$LAST_RESTART_FILE")
+elapsed=$((now - last_restart))
+if [ "$last_restart" -gt 0 ] && [ "$elapsed" -lt "$RESTART_COOLDOWN_SECONDS" ]; then
+    log "Restart suppressed by ${RESTART_COOLDOWN_SECONDS}s cooldown"
+    exit 1
+fi
+
+prune_restart_history "$now" "$RESTART_HISTORY_FILE"
+restart_count=$(/usr/bin/awk 'END { print NR + 0 }' "$RESTART_HISTORY_FILE")
+if [ "$restart_count" -ge "$MAX_RESTARTS_PER_HOUR" ]; then
+    log "Restart suppressed: hourly limit of $MAX_RESTARTS_PER_HOUR reached"
+    exit 1
+fi
+
+write_uint_file "$LAST_RESTART_FILE" "$now"
+printf '%s\n' "$now" >> "$RESTART_HISTORY_FILE"
+write_uint_file "$FAILURE_FILE" 0
+
+if recover_surge; then
+    exit 0
+fi
+
+log "Automatic recovery failed"
+exit 1

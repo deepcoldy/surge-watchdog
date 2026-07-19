@@ -1,0 +1,15 @@
+.DS_Store
+*.log
+*.error.log
+*.tmp
+build/
+/config
+.env
+.env.*
+*.csr
+*.p12
+*.p8
+*.pem
+*.cer
+*.key
+AuthKey_*.p8

@@ -1,0 +1,143 @@
+name: Release signed macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: release
+    env:
+      CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+      CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+    steps:
+      # actions/checkout v4.2.2, pinned to prevent tag retargeting.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Validate tag and repository privacy boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/SurgeWatchdogUI/Info.plist)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          test ! -e config
+          if find . -path ./.git -prune -o -type f \( -name '*.p12' -o -name '*.p8' -o -name '*.pem' -o -name '*.csr' \) -print -quit | grep -q .; then
+            echo "Signing material must not be committed to the repository." >&2
+            exit 1
+          fi
+
+      - name: Run project checks
+        run: ./scripts/test.sh
+
+      - name: Import release certificate into a temporary keychain
+        id: signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CERTIFICATE_P12_BASE64:?Missing certificate secret}"
+          : "${CERTIFICATE_P12_PASSWORD:?Missing certificate password secret}"
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/surge-watchdog-release.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "${CERTIFICATE_P12_BASE64}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" \
+            -k "${keychain_path}" \
+            -P "${CERTIFICATE_P12_PASSWORD}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "${keychain_password}" \
+            "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}"
+          identity="$(security find-identity -v -p codesigning "${keychain_path}" | \
+            sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          test -n "${identity}"
+          echo "identity=${identity}" >> "${GITHUB_OUTPUT}"
+          echo "keychain_path=${keychain_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build signed app
+        shell: bash
+        env:
+          SURGE_WATCHDOG_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          set -euo pipefail
+          ./scripts/build-ui-helper.sh "${RUNNER_TEMP}/Surge Watchdog.app"
+          codesign --verify --deep --strict --verbose=2 "${RUNNER_TEMP}/Surge Watchdog.app"
+
+      - name: Notarize and staple
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${APPLE_API_KEY_ID:?Missing Apple API key ID secret}"
+          : "${APPLE_API_ISSUER_ID:?Missing Apple API issuer ID secret}"
+          : "${APPLE_API_KEY_P8_BASE64:?Missing Apple API private key secret}"
+          api_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+          unsigned_zip="${RUNNER_TEMP}/Surge-Watchdog-notary.zip"
+          version="${GITHUB_REF_NAME#v}"
+          release_zip="${RUNNER_TEMP}/Surge-Watchdog-${version}.zip"
+          checksum="${release_zip}.sha256"
+          printf '%s' "${APPLE_API_KEY_P8_BASE64}" | base64 --decode > "${api_key_path}"
+          chmod 600 "${api_key_path}"
+          ditto -c -k --keepParent "${RUNNER_TEMP}/Surge Watchdog.app" "${unsigned_zip}"
+          xcrun notarytool submit "${unsigned_zip}" \
+            --key "${api_key_path}" \
+            --key-id "${APPLE_API_KEY_ID}" \
+            --issuer "${APPLE_API_ISSUER_ID}" \
+            --wait
+          xcrun stapler staple "${RUNNER_TEMP}/Surge Watchdog.app"
+          xcrun stapler validate "${RUNNER_TEMP}/Surge Watchdog.app"
+          spctl --assess --type execute --verbose=2 "${RUNNER_TEMP}/Surge Watchdog.app"
+          ditto -c -k --keepParent "${RUNNER_TEMP}/Surge Watchdog.app" "${release_zip}"
+          cd "${RUNNER_TEMP}"
+          shasum -a 256 "$(basename "${release_zip}")" > "$(basename "${checksum}")"
+          echo "release_zip=${release_zip}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ZIP: ${{ steps.package.outputs.release_zip }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            "${RELEASE_ZIP}" \
+            "${CHECKSUM}" \
+            --verify-tag \
+            --generate-notes \
+            --title "Surge Watchdog ${GITHUB_REF_NAME#v}"
+
+      - name: Remove temporary signing material
+        if: always()
+        shell: bash
+        env:
+          RELEASE_KEYCHAIN: ${{ steps.signing.outputs.keychain_path }}
+        run: |
+          set +e
+          if [[ -n "${RELEASE_KEYCHAIN:-}" ]]; then
+            security delete-keychain "${RELEASE_KEYCHAIN}"
+          fi
+          rm -f "${RUNNER_TEMP}/developer-id.p12"
+          rm -f "${RUNNER_TEMP}"/AuthKey_*.p8
