@@ -17,12 +17,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     environment: release
-    env:
-      CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
-      CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
     steps:
       # actions/checkout v4.2.2, pinned to prevent tag retargeting.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -36,7 +30,10 @@ jobs:
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/SurgeWatchdogUI/Info.plist)"
           test "${GITHUB_REF_NAME}" = "v${version}"
           test ! -e config
-          if find . -path ./.git -prune -o -type f \( -name '*.p12' -o -name '*.p8' -o -name '*.pem' -o -name '*.csr' \) -print -quit | grep -q .; then
+          if find . -path ./.git -prune -o -type f \( \
+            -name '*.p12' -o -name '*.p8' -o -name '*.pem' -o \
+            -name '*.csr' -o -name '*.key' -o -name '*.keychain*' \
+          \) -print -quit | grep -q .; then
             echo "Signing material must not be committed to the repository." >&2
             exit 1
           fi
@@ -47,6 +44,9 @@ jobs:
       - name: Import release certificate into a temporary keychain
         id: signing
         shell: bash
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
         run: |
           set -euo pipefail
           : "${CERTIFICATE_P12_BASE64:?Missing certificate secret}"
@@ -87,6 +87,10 @@ jobs:
       - name: Notarize and staple
         id: package
         shell: bash
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
         run: |
           set -euo pipefail
           : "${APPLE_API_KEY_ID:?Missing Apple API key ID secret}"
