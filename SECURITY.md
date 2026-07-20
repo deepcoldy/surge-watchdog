@@ -9,8 +9,10 @@ logs, or other home-network data.
 
 The release workflow receives only a dedicated Developer ID certificate and a
 dedicated Apple notarization API key through the protected `release` GitHub
-Environment. It imports them into a temporary Keychain, removes temporary files
-after the job, and publishes only the signed app ZIP and its SHA-256 checksum.
+Environment. Each secret is exposed only to the single step that consumes it:
+the certificate import step or the notarization step. The workflow imports the
+certificate into a temporary Keychain, removes temporary files after the job,
+and publishes only the signed app ZIP and its SHA-256 checksum.
 
 ## Data excluded from the repository
 
