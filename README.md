@@ -19,6 +19,8 @@
 
 关闭主窗口不会退出应用，也不会停止后台监控。需要完全退出菜单栏进程时，可使用菜单栏菜单或“设置”页的“完全退出 Surge Watchdog”。即使菜单栏应用退出，已经启用的 launchd 健康检查仍会继续运行。
 
+菜单栏应用在后台启动时不会提前创建隐藏的主窗口；关闭主窗口后也会释放对应的界面资源。日志只在打开主窗口或进入“监控日志”页面时读取，避免后台运行产生无意义的 SwiftUI 布局和文件读取负担。
+
 ## 检查和恢复链
 
 后台默认每 10 秒执行一次检查：
@@ -122,6 +124,8 @@ cd ~/iserver/surge-watchdog
 ## 应用签名与公证
 
 没有指定签名身份时，构建脚本会继续使用 ad-hoc 签名，仅适合本机开发。正式签名需要 Apple Developer Program 中的 **Developer ID Application** 证书及其私钥；当前钥匙串可用身份可用下列命令查看：
+
+如果本机刚更新过 Command Line Tools，Swift 编译器与默认 SDK 暂时不匹配，可通过 `SURGE_WATCHDOG_SWIFT_SDK` 指向另一套已安装的 macOS SDK；未设置时仍使用系统默认 SDK。
 
 ```sh
 security find-identity -v -p codesigning

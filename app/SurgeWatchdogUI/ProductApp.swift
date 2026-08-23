@@ -44,7 +44,7 @@ private struct CommandResult {
     let output: String
 }
 
-enum ProductHealthState {
+enum ProductHealthState: Equatable {
     case checking
     case healthy
     case unhealthy
@@ -73,14 +73,12 @@ final class WatchdogModel: ObservableObject {
     init() {
         refreshConfiguration()
         refreshPermission()
-        refreshLogs()
         refreshStatus()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshConfiguration()
                 self?.refreshPermission()
                 self?.refreshStatus()
-                self?.refreshLogs()
             }
         }
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -95,17 +93,21 @@ final class WatchdogModel: ObservableObject {
 
     func refreshConfiguration() {
         let config = readConfiguration()
-        monitoringEnabled = config["MONITORING_ENABLED"] != "0"
-        uiFallbackEnabled = config["ENABLE_UI_FALLBACK"] == "1"
+        let newMonitoringEnabled = config["MONITORING_ENABLED"] != "0"
+        let newUIFallbackEnabled = config["ENABLE_UI_FALLBACK"] == "1"
+        setIfChanged(\.monitoringEnabled, to: newMonitoringEnabled)
+        setIfChanged(\.uiFallbackEnabled, to: newUIFallbackEnabled)
         if let days = Int(config["LOG_RETENTION_DAYS"] ?? ""), (1...90).contains(days) {
-            logRetentionDays = days
+            setIfChanged(\.logRetentionDays, to: days)
         }
-        launchAtLogin = config["LAUNCH_AT_LOGIN"] != "0" &&
+        let newLaunchAtLogin = config["LAUNCH_AT_LOGIN"] != "0" &&
             ProductPaths.fileManager.fileExists(atPath: ProductPaths.launchAgentURL.path)
-        uiProbeReady = ProductPaths.fileManager.fileExists(atPath: ProductPaths.probeSuccessURL.path)
-        if !monitoringEnabled && !isBusy {
-            healthState = .paused
-            healthTitle = "监控已暂停"
+        let newUIProbeReady = ProductPaths.fileManager.fileExists(atPath: ProductPaths.probeSuccessURL.path)
+        setIfChanged(\.launchAtLogin, to: newLaunchAtLogin)
+        setIfChanged(\.uiProbeReady, to: newUIProbeReady)
+        if !newMonitoringEnabled && !isBusy {
+            setIfChanged(\.healthState, to: .paused)
+            setIfChanged(\.healthTitle, to: "监控已暂停")
         }
     }
 
@@ -114,7 +116,7 @@ final class WatchdogModel: ObservableObject {
         if granted && !accessibilityGranted {
             lastActionMessage = "辅助功能权限已生效，可以运行 UI 安全探测。"
         }
-        accessibilityGranted = granted
+        setIfChanged(\.accessibilityGranted, to: granted)
     }
 
     func requestAccessibilityPermission() {
@@ -313,10 +315,11 @@ final class WatchdogModel: ObservableObject {
         }.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && seen.insert($0).inserted }
             .sorted(by: >)
-        logText = lines.prefix(500).joined(separator: "\n")
-        if logText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            logText = "暂无监控日志"
-        }
+        let latestText = lines.prefix(500).joined(separator: "\n")
+        let displayedText = latestText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "暂无监控日志"
+            : latestText
+        setIfChanged(\.logText, to: displayedText)
     }
 
     func openLogDirectory() {
@@ -440,6 +443,14 @@ final class WatchdogModel: ObservableObject {
         }
     }
 
+    private func setIfChanged<Value: Equatable>(
+        _ keyPath: ReferenceWritableKeyPath<WatchdogModel, Value>,
+        to newValue: Value
+    ) {
+        guard self[keyPath: keyPath] != newValue else { return }
+        self[keyPath: keyPath] = newValue
+    }
+
     private static let displayDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
@@ -477,7 +488,7 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var statusSummaryItem: NSMenuItem!
     private var monitoringMenuItem: NSMenuItem!
     private var permissionMenuItem: NSMenuItem!
-    private var windowController: NSWindowController!
+    private var windowController: NSWindowController?
     private var model: WatchdogModel!
     private var requestTimer: Timer?
     private var statusTimer: Timer?
@@ -487,7 +498,6 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         NSApp.setActivationPolicy(.accessory)
         model = WatchdogModel()
         createStatusItem()
-        createMainWindow()
         startRequestListener()
 
         let backgroundLaunch = ProcessInfo.processInfo.arguments.contains("--background")
@@ -508,15 +518,27 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
-        return false
+        true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let closedWindow = notification.object as? NSWindow,
+              closedWindow === windowController?.window else { return }
+        DispatchQueue.main.async { [weak self, weak closedWindow] in
+            guard let self, self.windowController?.window === closedWindow else { return }
+            self.windowController = nil
+        }
     }
 
     @objc private func showMainWindow(_ sender: Any?) {
+        if windowController == nil {
+            createMainWindow()
+        }
         model.refreshConfiguration()
         model.refreshPermission()
         model.refreshStatus()
         model.refreshLogs()
+        guard let windowController else { return }
         NSApp.activate(ignoringOtherApps: true)
         windowController.showWindow(nil)
         windowController.window?.makeKeyAndOrderFront(nil)
@@ -672,6 +694,7 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
 
     private func createMainWindow() {
+        guard windowController == nil else { return }
         let content = ProductDashboardView(model: model)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 820, height: 650),
@@ -754,9 +777,25 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
 }
 
+private enum DashboardSection: Int, CaseIterable, Identifiable {
+    case overview
+    case logs
+    case settings
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .overview: return "概览"
+        case .logs: return "监控日志"
+        case .settings: return "设置"
+        }
+    }
+}
+
 private struct ProductDashboardView: View {
     @ObservedObject var model: WatchdogModel
-    @State private var selectedSection = 0
+    @State private var selectedSection: DashboardSection = .overview
 
     var body: some View {
         VStack(spacing: 0) {
@@ -779,13 +818,7 @@ private struct ProductDashboardView: View {
             .padding(.top, 20)
             .padding(.bottom, 14)
 
-            Picker("页面", selection: $selectedSection) {
-                Text("概览").tag(0)
-                Text("监控日志").tag(1)
-                Text("设置").tag(2)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            sectionSelector
             .padding(.horizontal, 24)
             .padding(.bottom, 16)
 
@@ -793,14 +826,48 @@ private struct ProductDashboardView: View {
 
             Group {
                 switch selectedSection {
-                case 1: logsView
-                case 2: settingsView
-                default: overviewView
+                case .logs: logsView
+                case .settings: settingsView
+                case .overview: overviewView
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var sectionSelector: some View {
+        HStack(spacing: 4) {
+            ForEach(DashboardSection.allCases) { section in
+                Button {
+                    selectedSection = section
+                    if section == .logs {
+                        model.refreshLogs()
+                    }
+                } label: {
+                    Text(section.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(selectedSection == section ? Color.white : Color.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    selectedSection == section ? Color.accentColor : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+                .accessibilityAddTraits(selectedSection == section ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.5))
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("页面")
     }
 
     private var statusColor: Color {

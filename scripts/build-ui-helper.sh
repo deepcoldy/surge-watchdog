@@ -8,6 +8,7 @@ SOURCE_DIR="$PROJECT_DIR/app/SurgeWatchdogUI"
 ICON_SOURCE_B64="$SOURCE_DIR/Assets/AppIconMaster-v2.jpg.b64"
 OUTPUT_APP=${1:-"$PROJECT_DIR/build/Surge Watchdog.app"}
 SIGN_IDENTITY=${SURGE_WATCHDOG_SIGN_IDENTITY:-}
+SWIFT_SDK=${SURGE_WATCHDOG_SWIFT_SDK:-}
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY="-"
 fi
@@ -27,7 +28,13 @@ ICON_SOURCE="$TEMPORARY_DIR/AppIconMaster.jpg"
 PREPARED_ICON="$TEMPORARY_DIR/AppIcon.png"
 ICONSET="$TEMPORARY_DIR/AppIcon.iconset"
 /usr/bin/base64 -D -i "$ICON_SOURCE_B64" -o "$ICON_SOURCE"
-/usr/bin/xcrun swift "$PROJECT_DIR/scripts/prepare-app-icon.swift" "$ICON_SOURCE" "$PREPARED_ICON"
+if [ -n "$SWIFT_SDK" ]; then
+    /usr/bin/xcrun swift -sdk "$SWIFT_SDK" \
+        "$PROJECT_DIR/scripts/prepare-app-icon.swift" "$ICON_SOURCE" "$PREPARED_ICON"
+else
+    /usr/bin/xcrun swift \
+        "$PROJECT_DIR/scripts/prepare-app-icon.swift" "$ICON_SOURCE" "$PREPARED_ICON"
+fi
 /bin/mkdir -p "$ICONSET"
 for icon_spec in \
     '16 icon_16x16.png' \
@@ -47,13 +54,24 @@ for icon_spec in \
 done
 /usr/bin/iconutil -c icns "$ICONSET" -o "$TEMPORARY_APP/Contents/Resources/AppIcon.icns"
 
-/usr/bin/xcrun swiftc -O \
-    -framework AppKit \
-    -framework ApplicationServices \
-    -framework SwiftUI \
-    "$SOURCE_DIR/main.swift" \
-    "$SOURCE_DIR/ProductApp.swift" \
-    -o "$TEMPORARY_APP/Contents/MacOS/Surge Watchdog"
+if [ -n "$SWIFT_SDK" ]; then
+    /usr/bin/xcrun swiftc -O \
+        -sdk "$SWIFT_SDK" \
+        -framework AppKit \
+        -framework ApplicationServices \
+        -framework SwiftUI \
+        "$SOURCE_DIR/main.swift" \
+        "$SOURCE_DIR/ProductApp.swift" \
+        -o "$TEMPORARY_APP/Contents/MacOS/Surge Watchdog"
+else
+    /usr/bin/xcrun swiftc -O \
+        -framework AppKit \
+        -framework ApplicationServices \
+        -framework SwiftUI \
+        "$SOURCE_DIR/main.swift" \
+        "$SOURCE_DIR/ProductApp.swift" \
+        -o "$TEMPORARY_APP/Contents/MacOS/Surge Watchdog"
+fi
 
 /usr/bin/plutil -lint "$TEMPORARY_APP/Contents/Info.plist" >/dev/null
 if [ "$SIGN_IDENTITY" = "-" ]; then

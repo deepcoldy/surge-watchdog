@@ -37,6 +37,15 @@ helper_icon_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' \
 /usr/bin/grep -q 'statusItem.menu = statusMenu' "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift"
 /usr/bin/grep -q '完全退出 Surge Watchdog' "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift"
 /usr/bin/grep -q 'tccutil' "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift"
+/usr/bin/grep -q 'if windowController == nil' "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift"
+/usr/bin/grep -q 'windowController = nil' "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift"
+main_window_occurrences=$(/usr/bin/grep -c 'createMainWindow()' \
+    "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift")
+[ "$main_window_occurrences" -eq 2 ]
+if /usr/bin/grep -q '\.pickerStyle(.segmented)' "$PROJECT_DIR/app/SurgeWatchdogUI/ProductApp.swift"; then
+    printf '%s\n' "Native segmented Picker must not be used because it can enter a SwiftUI layout loop" >&2
+    exit 1
+fi
 /usr/bin/plutil -lint "$PLIST_TEMPLATE" >/dev/null
 /usr/bin/plutil -lint "$APP_PLIST_TEMPLATE" >/dev/null
 
