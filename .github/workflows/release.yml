@@ -14,6 +14,12 @@ concurrency:
 
 jobs:
   release:
+    # Keep signing material unavailable to runs initiated by any other account,
+    # even if repository permissions are changed later.
+    if: >-
+      github.repository == 'deepcoldy/surge-watchdog' &&
+      github.actor == 'deepcoldy' &&
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-15
     timeout-minutes: 30
     environment: release
