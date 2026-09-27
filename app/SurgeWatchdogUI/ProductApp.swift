@@ -17,6 +17,8 @@ private enum ProductPaths {
     static let responseURL = stateDirectory.appendingPathComponent("ui-response.json")
     static let requestLockURL = stateDirectory.appendingPathComponent("ui-request.lock", isDirectory: true)
     static let probeSuccessURL = stateDirectory.appendingPathComponent("ui_probe_success_epoch")
+    static let runtimeVersionURL = supportDirectory.appendingPathComponent("runtime-version")
+    static let monitorAgentURL = home.appendingPathComponent("Library/LaunchAgents/com.shenhan.surge-watchdog.plist")
     static let logDirectory = home.appendingPathComponent("Library/Logs/Surge Watchdog", isDirectory: true)
     static let legacyLogURL = home.appendingPathComponent("Library/Logs/surge-watchdog.log")
     static let errorLogURL = home.appendingPathComponent("Library/Logs/surge-watchdog.error.log")
@@ -66,6 +68,9 @@ final class WatchdogModel: ObservableObject {
     @Published var logText = "暂无监控日志"
     @Published var isBusy = false
     @Published var lastActionMessage = ""
+    @Published var runtimeInstalled = false
+    @Published var runtimeUpdateAvailable = false
+    @Published var isInstallingRuntime = false
 
     private var refreshTimer: Timer?
     private var permissionTimer: Timer?
@@ -92,8 +97,17 @@ final class WatchdogModel: ObservableObject {
     }
 
     func refreshConfiguration() {
+        guard !isInstallingRuntime else { return }
+        let installed = ProductPaths.fileManager.isExecutableFile(atPath: ProductPaths.watchdogURL.path) &&
+            ProductPaths.fileManager.fileExists(atPath: ProductPaths.configURL.path) &&
+            ProductPaths.fileManager.fileExists(atPath: ProductPaths.monitorAgentURL.path)
+        let revision = (try? String(contentsOf: ProductPaths.runtimeVersionURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let bundleVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        setIfChanged(\.runtimeInstalled, to: installed)
+        setIfChanged(\.runtimeUpdateAvailable, to: installed && revision != bundleVersion)
         let config = readConfiguration()
-        let newMonitoringEnabled = config["MONITORING_ENABLED"] != "0"
+        let newMonitoringEnabled = installed && config["MONITORING_ENABLED"] != "0"
         let newUIFallbackEnabled = config["ENABLE_UI_FALLBACK"] == "1"
         setIfChanged(\.monitoringEnabled, to: newMonitoringEnabled)
         setIfChanged(\.uiFallbackEnabled, to: newUIFallbackEnabled)
@@ -167,6 +181,12 @@ final class WatchdogModel: ObservableObject {
 
     func refreshStatus() {
         guard !isBusy else { return }
+        guard runtimeInstalled else {
+            healthState = .paused
+            healthTitle = "欢迎使用 Surge Watchdog"
+            healthDetail = "先安装后台监控组件，再开启自动监控。所有配置与日志都保存在这台 Mac 上。"
+            return
+        }
         isBusy = true
         runWatchdog(arguments: ["--status"]) { [weak self] result in
             guard let self else { return }
@@ -195,6 +215,7 @@ final class WatchdogModel: ObservableObject {
     }
 
     func runUIProbe() {
+        guard runtimeInstalled else { return }
         refreshPermission()
         guard accessibilityGranted else {
             repairAccessibilityPermission()
@@ -217,6 +238,26 @@ final class WatchdogModel: ObservableObject {
     }
 
     func setMonitoringEnabled(_ enabled: Bool) {
+        guard runtimeInstalled, !isInstallingRuntime else { return }
+        if enabled {
+            guard !isBusy else { return }
+            isBusy = true
+            runWatchdog(arguments: ["--status"]) { [weak self] result in
+                guard let self else { return }
+                self.isBusy = false
+                guard result.status == 0 else {
+                    self.lastActionMessage = "请先让 Surge 网关恢复正常再开启监控：\(Self.lastMeaningfulLine(in: result.output))"
+                    self.refreshStatus()
+                    return
+                }
+                self.saveMonitoringEnabled(true)
+            }
+            return
+        }
+        saveMonitoringEnabled(false)
+    }
+
+    private func saveMonitoringEnabled(_ enabled: Bool) {
         do {
             try updateConfiguration(key: "MONITORING_ENABLED", value: enabled ? "1" : "0")
             monitoringEnabled = enabled
@@ -238,6 +279,7 @@ final class WatchdogModel: ObservableObject {
     }
 
     func setUIFallbackEnabled(_ enabled: Bool) {
+        guard runtimeInstalled, !isInstallingRuntime else { return }
         if enabled {
             if !accessibilityGranted {
                 lastActionMessage = "请先授予辅助功能权限。"
@@ -262,6 +304,7 @@ final class WatchdogModel: ObservableObject {
     }
 
     func setLogRetentionDays(_ days: Int) {
+        guard runtimeInstalled, !isInstallingRuntime else { return }
         let safeDays = min(90, max(1, days))
         do {
             try updateConfiguration(key: "LOG_RETENTION_DAYS", value: String(safeDays))
@@ -275,6 +318,7 @@ final class WatchdogModel: ObservableObject {
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
+        guard runtimeInstalled, !isInstallingRuntime else { return }
         do {
             try updateConfiguration(key: "LAUNCH_AT_LOGIN", value: enabled ? "1" : "0")
             if enabled {
@@ -290,6 +334,72 @@ final class WatchdogModel: ObservableObject {
             lastActionMessage = "修改登录启动设置失败：\(error.localizedDescription)"
             launchAtLogin = ProductPaths.fileManager.fileExists(atPath: ProductPaths.launchAgentURL.path)
         }
+    }
+
+    func installRuntime() {
+        guard !isBusy, !isInstallingRuntime else { return }
+        let appURL = Bundle.main.bundleURL.standardizedFileURL
+        let applicationDirectories = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            ProductPaths.home.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        guard applicationDirectories.contains(where: { appURL.path.hasPrefix($0.path + "/") }) else {
+            lastActionMessage = "请先退出应用，将 Surge Watchdog 拖入“应用程序”文件夹，重新打开后安装。这样开机启动与辅助功能授权才能保持稳定。"
+            return
+        }
+        guard let resources = Bundle.main.resourceURL,
+              let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else {
+            lastActionMessage = "安装包不完整，请重新下载。"
+            return
+        }
+        isInstallingRuntime = true
+        isBusy = true
+        lastActionMessage = "正在安装后台组件…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<Void, Error>
+            do {
+                try RuntimeInstaller.install(
+                    resources: resources, home: ProductPaths.home, appURL: appURL, version: version
+                ) { plistURL in
+                    _ = try Self.launchctl(["bootout", "gui/\(getuid())/\(RuntimeInstaller.label)"])
+                    let command = try Self.launchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
+                    guard command.status == 0 else {
+                        throw NSError(domain: "SurgeWatchdog.Install", code: Int(command.status), userInfo: [
+                            NSLocalizedDescriptionKey: "无法启动后台组件：\(command.output)"
+                        ])
+                    }
+                }
+                result = .success(())
+            } catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isInstallingRuntime = false
+                self.isBusy = false
+                self.refreshConfiguration()
+                switch result {
+                case .success:
+                    self.lastActionMessage = self.monitoringEnabled
+                        ? "后台组件已更新，保留原有监控设置。UI 恢复需重新通过安全探测。"
+                        : "安装完成。点击“立即检查”确认网关状态，再开启“自动监控与恢复”。"
+                case .failure(let error):
+                    self.lastActionMessage = "安装失败：\(error.localizedDescription)"
+                }
+                self.refreshStatus()
+            }
+        }
+    }
+
+    private static func launchctl(_ arguments: [String]) throws -> CommandResult {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return CommandResult(status: process.terminationStatus, output: String(data: output, encoding: .utf8) ?? "")
     }
 
     func refreshLogs() {
@@ -429,8 +539,8 @@ final class WatchdogModel: ObservableObject {
             process.standardError = pipe
             do {
                 try process.run()
-                process.waitUntilExit()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 let output = String(data: data, encoding: .utf8) ?? ""
                 DispatchQueue.main.async {
                     completion(CommandResult(status: process.terminationStatus, output: output))
@@ -602,6 +712,7 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         monitoringMenuItem?.title = model.monitoringEnabled ? "暂停自动监控" : "继续自动监控"
         monitoringMenuItem?.state = model.monitoringEnabled ? .on : .off
+        monitoringMenuItem?.isEnabled = model.runtimeInstalled && !model.isBusy
         permissionMenuItem?.title = model.accessibilityGranted
             ? "辅助功能权限：已就绪"
             : "修复辅助功能授权…"
@@ -722,6 +833,7 @@ final class ProductAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func handlePendingRequest() {
         guard !requestInProgress,
+              !model.isInstallingRuntime,
               ProductPaths.fileManager.fileExists(atPath: ProductPaths.requestURL.path) else { return }
         requestInProgress = true
         defer {
@@ -882,7 +994,7 @@ private struct ProductDashboardView: View {
     private var statusBadge: some View {
         HStack(spacing: 7) {
             Circle().fill(statusColor).frame(width: 8, height: 8)
-            Text(model.monitoringEnabled ? "监控中" : "已暂停")
+            Text(!model.runtimeInstalled ? "待安装" : (model.monitoringEnabled ? "监控中" : "已暂停"))
                 .font(.subheadline.weight(.medium))
         }
         .padding(.horizontal, 12)
@@ -893,6 +1005,21 @@ private struct ProductDashboardView: View {
     private var overviewView: some View {
         ScrollView {
             VStack(spacing: 16) {
+                if !model.runtimeInstalled || model.runtimeUpdateAvailable {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label(model.runtimeInstalled ? "后台组件有更新" : "完成首次设置", systemImage: "shippingbox")
+                            .font(.headline)
+                        Text("安装这台 Mac 所需的后台检查器与登录启动项。首次安装默认暂停监控，无需管理员权限。")
+                            .font(.callout).foregroundStyle(.secondary)
+                        Button(model.runtimeInstalled ? "更新后台组件" : "安装后台组件") {
+                            model.installRuntime()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.isBusy)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .productCard()
+                }
                 VStack(alignment: .leading, spacing: 14) {
                     HStack(alignment: .top, spacing: 16) {
                         Image(systemName: healthSymbol)
@@ -916,7 +1043,7 @@ private struct ProductDashboardView: View {
                             Label("立即检查", systemImage: "arrow.clockwise")
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.isBusy)
+                        .disabled(model.isBusy || !model.runtimeInstalled)
 
                         Button {
                             model.runUIProbe()
@@ -924,7 +1051,7 @@ private struct ProductDashboardView: View {
                             Label("UI 安全探测", systemImage: "cursorarrow.click.2")
                         }
                         .buttonStyle(.bordered)
-                        .disabled(model.isBusy)
+                        .disabled(model.isBusy || !model.runtimeInstalled)
 
                         if model.isBusy { ProgressView().controlSize(.small) }
                     }
@@ -960,6 +1087,7 @@ private struct ProductDashboardView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    .disabled(!model.runtimeInstalled || model.isBusy)
                     Divider()
                     HStack {
                         Label(

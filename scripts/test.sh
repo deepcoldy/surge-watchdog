@@ -29,6 +29,19 @@ helper_display_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' \
 [ "$helper_display_name" = "Surge Watchdog" ]
 [ -x "$TEST_DIR/Surge Watchdog.app/Contents/MacOS/Surge Watchdog" ]
 [ -r "$TEST_DIR/Surge Watchdog.app/Contents/Resources/AppIcon.icns" ]
+[ -x "$TEST_DIR/Surge Watchdog.app/Contents/Resources/Runtime/bin/surge-watchdog" ]
+[ -r "$TEST_DIR/Surge Watchdog.app/Contents/Resources/Runtime/config.example" ]
+test_sdk=${SURGE_WATCHDOG_SWIFT_SDK:-$(/usr/bin/xcrun --show-sdk-path)}
+/usr/bin/xcrun swiftc -sdk "$test_sdk" \
+    "$PROJECT_DIR/app/SurgeWatchdogUI/RuntimeInstaller.swift" \
+    "$PROJECT_DIR/tests/RuntimeInstallerTests.swift" -o "$TEST_DIR/runtime-tests"
+"$TEST_DIR/runtime-tests" "$TEST_DIR/Surge Watchdog.app/Contents/Resources" \
+    "$TEST_DIR/install with spaces & symbols"
+minimum_macos=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+    "$TEST_DIR/Surge Watchdog.app/Contents/Info.plist")
+binary_macos=$(/usr/bin/otool -l "$TEST_DIR/Surge Watchdog.app/Contents/MacOS/Surge Watchdog" | \
+    /usr/bin/awk '/ minos / {print $2; exit}')
+[ "$minimum_macos" = "$binary_macos" ]
 helper_icon_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' \
     "$TEST_DIR/Surge Watchdog.app/Contents/Info.plist")
 [ "$helper_icon_name" = "AppIcon" ]

@@ -4,13 +4,17 @@ on:
   push:
     branches:
       - main
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
+    if: >-
+      github.repository == 'deepcoldy/surge-watchdog' &&
+      github.actor == 'deepcoldy' &&
+      github.triggering_actor == 'deepcoldy'
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -18,5 +22,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Check source privacy
+        run: python3 scripts/check-source-privacy.py
       - name: Run project checks
         run: ./scripts/test.sh

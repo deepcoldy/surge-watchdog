@@ -23,6 +23,12 @@ TEMPORARY_APP="$TEMPORARY_DIR/Surge Watchdog.app"
 /bin/mkdir -p "$TEMPORARY_APP/Contents/MacOS"
 /bin/mkdir -p "$TEMPORARY_APP/Contents/Resources"
 /usr/bin/install -m 0644 "$SOURCE_DIR/Info.plist" "$TEMPORARY_APP/Contents/Info.plist"
+MINIMUM_MACOS=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$SOURCE_DIR/Info.plist")
+RUNTIME_DIR="$TEMPORARY_APP/Contents/Resources/Runtime"
+/bin/mkdir -p "$RUNTIME_DIR/bin" "$RUNTIME_DIR/launchd"
+/usr/bin/install -m 0755 "$PROJECT_DIR/bin/surge-watchdog" "$RUNTIME_DIR/bin/surge-watchdog"
+/usr/bin/install -m 0644 "$PROJECT_DIR/config.example" "$RUNTIME_DIR/config.example"
+/usr/bin/install -m 0644 "$PROJECT_DIR/launchd/"*.plist.in "$RUNTIME_DIR/launchd/"
 
 ICON_SOURCE="$TEMPORARY_DIR/AppIconMaster.jpg"
 PREPARED_ICON="$TEMPORARY_DIR/AppIcon.png"
@@ -56,20 +62,24 @@ done
 
 if [ -n "$SWIFT_SDK" ]; then
     /usr/bin/xcrun swiftc -O \
+        -target "arm64-apple-macosx${MINIMUM_MACOS}" \
         -sdk "$SWIFT_SDK" \
         -framework AppKit \
         -framework ApplicationServices \
         -framework SwiftUI \
         "$SOURCE_DIR/main.swift" \
         "$SOURCE_DIR/ProductApp.swift" \
+        "$SOURCE_DIR/RuntimeInstaller.swift" \
         -o "$TEMPORARY_APP/Contents/MacOS/Surge Watchdog"
 else
     /usr/bin/xcrun swiftc -O \
+        -target "arm64-apple-macosx${MINIMUM_MACOS}" \
         -framework AppKit \
         -framework ApplicationServices \
         -framework SwiftUI \
         "$SOURCE_DIR/main.swift" \
         "$SOURCE_DIR/ProductApp.swift" \
+        "$SOURCE_DIR/RuntimeInstaller.swift" \
         -o "$TEMPORARY_APP/Contents/MacOS/Surge Watchdog"
 fi
 

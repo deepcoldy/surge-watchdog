@@ -12,4 +12,6 @@ build/
 *.pem
 *.cer
 *.key
+*.keychain*
+*.bundle
 AuthKey_*.p8

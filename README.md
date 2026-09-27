@@ -47,8 +47,26 @@ Gateway VM IP 每次都从 Surge 状态文件重新发现，不依赖固定地�
 
 ## 安装
 
+### 下载已签名应用（推荐）
+
+需要 **Apple Silicon Mac、macOS 13 或更新版本**，以及已配置且正常运行的 Surge 家庭网关。当前不提供 Intel 安装包。本项目为独立社区工具，与 Surge 官方无隶属关系。
+
+1. 从 GitHub Releases 下载最新 ZIP，解压后把 `Surge Watchdog.app` 拖入 `/Applications` 或 `~/Applications`。
+2. 打开应用，在“概览”点击“安装后台组件”。无需 Xcode、命令行工具或管理员权限。
+3. 新安装默认暂停监控。点击“立即检查”，确认正常后开启“自动监控与恢复”。
+4. 如果需要 UI 定向恢复，再授权辅助功能并运行“UI 安全探测”。
+
+从 2.3.0 开始，签名 App 内包含后台检查器和默认配置，安装时只写入当前用户目录。更新 App 后，“概览”会提示更新后台组件；保留既有监控设置和日志，UI 恢复需要重新探测。安装失败会恢复先前的组件和配置。
+
+旧版 2.2.0 的 ZIP 仅有界面程序，首次使用还需从源码安装后台组件，而且二进制实际要求 macOS 15。请优先使用 2.3.0 或更新版本。
+
+### 从源码安装（开发者）
+
+需要 Apple Command Line Tools。未设置 Developer ID 身份时为本机 ad-hoc 构建；日常用户应使用上面的已签名发行版。
+
 ```sh
-cd ~/iserver/surge-watchdog
+git clone https://github.com/deepcoldy/surge-watchdog.git
+cd surge-watchdog
 ./scripts/test.sh
 ./scripts/install.sh
 ```
@@ -159,7 +177,7 @@ export SURGE_WATCHDOG_NOTARY_PROFILE='surge-watchdog-notary'
 
 ### GitHub Release 自动发布
 
-仓库包含两条 GitHub Actions 工作流：普通提交运行 `.github/workflows/test.yml`；推送与 `Info.plist` 版本一致的 `v*` 标签时，`.github/workflows/release.yml` 会在 GitHub 托管的临时 macOS Runner 上完成测试、Developer ID 签名、Apple 公证、ticket 装订，并发布 ZIP 与 SHA-256 到 GitHub Release。
+仓库包含两条 GitHub Actions 工作流：仓库所有者推送 `main` 或手动触发时运行测试，外部 PR 不自动运行；所有者推送与 `Info.plist` 版本一致的 `vX.Y.Z` 标签时，发布工作流在 GitHub 托管的临时 macOS Runner 上完成测试、Developer ID 签名、Apple 公证、ticket 装订，并发布 ZIP 与 SHA-256。发布提交必须属于 `main`；首次触发者和重新运行者都必须是 `deepcoldy`。
 
 `release` GitHub Environment 需要以下 secrets：
 
@@ -172,8 +190,8 @@ export SURGE_WATCHDOG_NOTARY_PROFILE='surge-watchdog-notary'
 发布时只提交版本标签，例如：
 
 ```sh
-git tag -a v2.2.0 -m 'Surge Watchdog 2.2.0'
-git push origin v2.2.0
+git tag -a v2.3.0 -m 'Surge Watchdog 2.3.0'
+git push origin v2.3.0
 ```
 
 工作流不会运行安装器或本机健康检查，也不会读取家庭网关配置与日志。详细边界见 `SECURITY.md`。仓库若为私有，Release 也只对有仓库访问权限的用户可见；仓库改为公开时，Release 会随之公开。
@@ -190,7 +208,7 @@ git push origin v2.2.0
 ## 卸载
 
 ```sh
-cd ~/iserver/surge-watchdog
+cd surge-watchdog
 ./scripts/uninstall.sh
 ```
 

@@ -19,6 +19,8 @@ jobs:
     if: >-
       github.repository == 'deepcoldy/surge-watchdog' &&
       github.actor == 'deepcoldy' &&
+      github.triggering_actor == 'deepcoldy' &&
+      github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-15
     timeout-minutes: 30
@@ -28,11 +30,14 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Validate tag and repository privacy boundary
         shell: bash
         run: |
           set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/SurgeWatchdogUI/Info.plist)"
           test "${GITHUB_REF_NAME}" = "v${version}"
           test ! -e config
@@ -45,7 +50,9 @@ jobs:
           fi
 
       - name: Run project checks
-        run: ./scripts/test.sh
+        run: |
+          python3 scripts/check-source-privacy.py
+          ./scripts/test.sh
 
       - name: Import release certificate into a temporary keychain
         id: signing
@@ -55,11 +62,14 @@ jobs:
           CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
         run: |
           set -euo pipefail
+          umask 077
           : "${CERTIFICATE_P12_BASE64:?Missing certificate secret}"
           : "${CERTIFICATE_P12_PASSWORD:?Missing certificate password secret}"
           certificate_path="${RUNNER_TEMP}/developer-id.p12"
           keychain_path="${RUNNER_TEMP}/surge-watchdog-release.keychain-db"
           keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::${keychain_password}"
+          echo "keychain_path=${keychain_path}" >> "${GITHUB_OUTPUT}"
           printf '%s' "${CERTIFICATE_P12_BASE64}" | base64 --decode > "${certificate_path}"
           security create-keychain -p "${keychain_password}" "${keychain_path}"
           security set-keychain-settings -lut 21600 "${keychain_path}"
@@ -69,6 +79,7 @@ jobs:
             -P "${CERTIFICATE_P12_PASSWORD}" \
             -T /usr/bin/codesign \
             -T /usr/bin/security
+          rm -f "${certificate_path}"
           security set-key-partition-list \
             -S apple-tool:,apple: \
             -s \
@@ -79,7 +90,6 @@ jobs:
             sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
           test -n "${identity}"
           echo "identity=${identity}" >> "${GITHUB_OUTPUT}"
-          echo "keychain_path=${keychain_path}" >> "${GITHUB_OUTPUT}"
 
       - name: Build signed app
         shell: bash
@@ -100,9 +110,11 @@ jobs:
         run: |
           set -euo pipefail
           : "${APPLE_API_KEY_ID:?Missing Apple API key ID secret}"
+          umask 077
           : "${APPLE_API_ISSUER_ID:?Missing Apple API issuer ID secret}"
           : "${APPLE_API_KEY_P8_BASE64:?Missing Apple API private key secret}"
           api_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+          trap 'rm -f "${api_key_path}"' EXIT
           unsigned_zip="${RUNNER_TEMP}/Surge-Watchdog-notary.zip"
           version="${GITHUB_REF_NAME#v}"
           release_zip="${RUNNER_TEMP}/Surge-Watchdog-${version}.zip"
@@ -146,8 +158,6 @@ jobs:
           RELEASE_KEYCHAIN: ${{ steps.signing.outputs.keychain_path }}
         run: |
           set +e
-          if [[ -n "${RELEASE_KEYCHAIN:-}" ]]; then
-            security delete-keychain "${RELEASE_KEYCHAIN}"
-          fi
+          security delete-keychain "${RELEASE_KEYCHAIN:-${RUNNER_TEMP}/surge-watchdog-release.keychain-db}"
           rm -f "${RUNNER_TEMP}/developer-id.p12"
           rm -f "${RUNNER_TEMP}"/AuthKey_*.p8

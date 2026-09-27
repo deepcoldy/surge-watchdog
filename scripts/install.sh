@@ -152,6 +152,8 @@ if ! /bin/launchctl bootstrap "$LAUNCH_DOMAIN" "$LAUNCH_AGENT_FILE"; then
     /bin/launchctl bootstrap "$LAUNCH_DOMAIN" "$LAUNCH_AGENT_FILE"
 fi
 /bin/launchctl kickstart -k "$LAUNCH_DOMAIN/$LABEL"
+/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INSTALL_UI_APP/Contents/Info.plist" \
+    > "$INSTALL_DIR/runtime-version"
 
 if /usr/bin/grep -q '^LAUNCH_AT_LOGIN=1$' "$CONFIG_FILE"; then
     temporary_app_plist="$APP_LAUNCH_AGENT_FILE.tmp.$$"
