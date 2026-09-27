@@ -8,6 +8,21 @@
 
 适用环境：**Apple Silicon Mac · macOS 13+ · 已配置好的 Surge 家庭网关**。发行版已通过 Developer ID 签名和 Apple 公证。
 
+## 界面预览
+
+健康状态、网关地址和恢复开关，一屏看清。
+
+![Surge Watchdog 概览：网关运行正常、自动监控已开启、UI 安全探测成功](docs/images/overview.png)
+
+<details>
+<summary>查看设置界面：登录启动、UI 定向恢复、日志自动清理</summary>
+
+![Surge Watchdog 设置：自动监控、登录启动、UI 定向恢复和日志保留天数](docs/images/settings.png)
+
+</details>
+
+*以上为 2.2.0 界面示例；图中日志保留 1 天是自定义设置，默认保留 7 天。*
+
 ## 它能帮你做什么？
 
 | 遇到的情况 | Watchdog 会怎么做 |
